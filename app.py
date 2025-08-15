@@ -1,7 +1,7 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from typing import List, Annotated, Dict
+from typing import List, Annotated, Dict, Optional
 from pydantic import BaseModel, Field
 from collections import defaultdict, deque
 import asyncio
@@ -76,7 +76,12 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # Buffer 10 nilai per session_id (sliding window) + result terakhir
-buffers = defaultdict(lambda: deque(maxlen=10))
+
+WINDOW_SIZE = 10
+DEFAULT_MODE = "sliding"   # atau "nonoverlap" kalau mau default non-overlap
+
+
+buffers = defaultdict(lambda: deque(maxlen=WINDOW_SIZE))
 last_result: Dict[str, dict] = {}
 
 # ========= Schemas =========
@@ -91,6 +96,7 @@ class PredictBatchIn(BaseModel):
 class IngestIn(BaseModel):
     session_id: str = "default"
     depth_cm: float
+    mode: Optional[str] = None   # "sliding" | "nonoverlap" (opsional)
 
 # ========= Util =========
 def to_model_input(arr: np.ndarray) -> np.ndarray:
@@ -197,13 +203,21 @@ def predict_batch(payload: PredictBatchIn):
         raise HTTPException(400, detail=str(e))
 
 @app.post("/ingest")
-async def ingest(payload: IngestIn):
+async def ingest(
+    payload: IngestIn,
+    mode: Optional[str] = Query(
+        default=None,
+        description="Pilih 'sliding' atau 'nonoverlap'. Query param ini override body."
+    ),
+):
     """
     Terima 1 angka kedalaman (cm) per kompresi dari perangkat.
-    Server akan:
-      - menyimpan ke buffer [len <= 10] per session_id
-      - jika buffer sudah berisi 10 nilai, jalankan inferensi (offload ke thread)
-      - kirim hasil via WebSocket ke klien yang subscribe pada session_id tsb
+
+    Mode window:
+      - sliding     -> STRIDE = 1 (prediksi setiap kali ada kompresi baru setelah warmup)
+      - nonoverlap  -> STRIDE = WINDOW_SIZE (prediksi tiap 10 kompresi, tanpa overlap)
+
+    Prioritas sumber mode: query param > body.mode > DEFAULT_MODE.
     """
     try:
         sid = payload.session_id
@@ -211,46 +225,60 @@ async def ingest(payload: IngestIn):
     except Exception as e:
         raise HTTPException(400, detail=f"Payload tidak valid: {e}")
 
-    # simpan ke buffer sliding window
-    buffers[sid].append(val)
-    ready = (len(buffers[sid]) == 10)
+    # Tentukan mode & stride
+    eff_mode = (mode or payload.mode or DEFAULT_MODE).lower().replace("-", "").replace("_", "")
+    if eff_mode in {"nonoverlap", "nonoverlapping", "block", "batch"}:
+        stride = WINDOW_SIZE
+        eff_mode = "nonoverlap"
+    else:
+        stride = 1
+        eff_mode = "sliding"
+
+    buf = buffers[sid]
+    buf.append(val)
 
     result = None
-    if ready:
-        # siapkan input [1,10,1] -> normalisasi
-        x = np.array(list(buffers[sid]), dtype=np.float32)   # [10]
-        x = to_model_input(x)                                 # [1,10,1]
+    inferred = False
+    if len(buf) == WINDOW_SIZE:
+        # Siapkan input dan jalankan ONNX di threadpool
+        x = np.array(list(buf), dtype=np.float32)    # [10]
+        x = to_model_input(x)                         # [1,10,1]
         x = normalize_windows(x)
 
-        # jalankan ONNX di threadpool agar tidak blok event loop
         def _run():
             return ort_sess.run(None, {INPUT_NAME: x})
 
         outputs = await asyncio.to_thread(_run)
-        probs = outputs[0]                                    # [1,4]
+        probs = outputs[0]                            # [1,4]
         if probs.ndim != 2:
             raise HTTPException(500, detail="Output model tidak berukuran [B, num_classes].")
 
         probs = softmax(probs)
         pred_idx, pred_label = postprocess(probs)
-
         result = {
             "class_index": int(pred_idx[0]),
             "class_label": pred_label[0],
             "probs": probs[0].round(6).tolist()
         }
-
-        # simpan & broadcast via WS
         last_result[sid] = result
         await manager.broadcast(sid, {"type": "inference", **result})
+        inferred = True
+
+        # Konsumsi buffer sesuai STRIDE
+        for _ in range(min(stride, len(buf))):
+            buf.popleft()
 
     return {
         "ok": True,
+        "mode": eff_mode,
+        "window_size": WINDOW_SIZE,
+        "stride": stride,
         "session_id": sid,
-        "buffer_len": len(buffers[sid]),
-        "inferred": bool(result),
+        "buffer_len": len(buf),  # panjang buffer SETELAH konsumsi
+        "inferred": inferred,
         "result": result
     }
+
 
 @app.get("/last/{session_id}")
 def get_last(session_id: str):
