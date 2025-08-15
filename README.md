@@ -66,7 +66,8 @@ Saat startup, console akan menampilkan IP lokal, contoh:
 - GET `/health` — cek status.
 - POST `/predict` — prediksi untuk 1 window (10 nilai).
 - POST `/predict/batch` — prediksi untuk banyak window (B x 10).
-- POST `/ingest` — kirim 1 nilai; setelah 10 nilai per session, otomatis inferensi.
+- POST `/ingest?mode=sliding` — kirim 1 nilai; setelah 10 nilai per session, otomatis inferensi, dan akan terus inferensi karena menggunakan konsep sliding window.
+- POST `/ingest?mode=nonoverlap` — kirim 1 nilai; setelah 10 nilai per session, otomatis inferensi, kemudian clear buffer dan menunggu hingga nilai total buffer 10.
 - GET `/last/{session_id}` — ambil hasil terakhir per session.
 - WS `/ws/{session_id}` — stream hasil inferensi.
 - UI `/ui?session_id=...` — halaman monitor sederhana.
@@ -158,4 +159,5 @@ print(requests.post(f"{base}/predict", json=payload).json())
 - Provider ONNX: menggunakan CPU (`CPUExecutionProvider`), tidak butuh CUDA.
 - CORS sudah diizinkan untuk semua origin, cocok untuk uji front-end lokal.
 - Akses dari perangkat lain gunakan IP yang dicetak saat startup, contoh `http://192.168.x.x:8000`.
-- Window input selalu 10 nilai. `/predict` butuh array panjang 10. `/ingest` akan infer setelah 10 nilai diterima per `session_id`.
+- Window input **(jika mode = sliding)** selalu 10 nilai. `/predict` butuh array panjang 10. `/ingest?mode=sliding` akan infer setelah 10 nilai diterima per `session_id`.
+- Jika menggunakan `/ingest?mode=nonoverlap` maka /predict akan dipanggil setiap kali 10 input nilai baru, tidak selalu run inference setelah 10 nilai.
